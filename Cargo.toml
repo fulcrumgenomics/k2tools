@@ -1,0 +1,43 @@
+[package]
+name = "k2tools"
+version = "0.1.0"
+authors = ["Tim Fennell <tim@fulcrumgenomics.com>"]
+description = "Rust CLI toolkit for working with kraken2 outputs"
+repository = "https://github.com/fulcrumgenomics/k2tools"
+homepage = "https://github.com/fulcrumgenomics/k2tools"
+license = "MIT"
+edition = "2024"
+rust-version = "1.85.0"
+
+[lib]
+name = "k2tools_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "k2tools"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "wrap_help", "unicode"] }
+anyhow = "1"
+log = "0"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+csv = "1"
+chrono = "0.4"
+rpmalloc = "0.2"
+seq_io = "0.3"
+pooled-writer = "0.3"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+fgoxide = "0.6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+built = "0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
