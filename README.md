@@ -10,9 +10,9 @@ A fast Rust CLI toolkit for working with [kraken2](https://github.com/DerrickWoo
 <p>
 <a href="https://fulcrumgenomics.com">
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/logos/fulcrumgenomics-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset=".github/logos/fulcrumgenomics-light.svg">
-  <img alt="Fulcrum Genomics" src=".github/logos/fulcrumgenomics-light.svg" height="100">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/fulcrumgenomics/k2tools/main/.github/logos/fulcrumgenomics-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/fulcrumgenomics/k2tools/main/.github/logos/fulcrumgenomics-light.svg">
+  <img alt="Fulcrum Genomics" src="https://raw.githubusercontent.com/fulcrumgenomics/k2tools/main/.github/logos/fulcrumgenomics-light.svg" height="100">
 </picture>
 </a>
 </p>
