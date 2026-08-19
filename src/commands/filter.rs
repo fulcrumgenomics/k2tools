@@ -64,6 +64,11 @@ const STDOUT_PATH: &str = "-";
 /// - **`--include-unclassified`** (`-u`): Include reads that kraken2 could not classify
 ///   (taxon ID 0). Can be combined with `--taxon-ids` to extract both classified and
 ///   unclassified reads in a single pass.
+/// - **`--exclude-taxon-ids`** (`-e`): Taxon IDs to remove from the selection built by
+///   the options above. Requires `--taxon-ids`. When `--include-descendants` is set,
+///   each excluded taxon's descendants are excluded as well. Excluded taxa that do not
+///   appear in the report are ignored (with a warning), since a taxon with no reads in
+///   the sample has nothing to exclude.
 ///
 /// # Output
 ///
@@ -114,6 +119,24 @@ const STDOUT_PATH: &str = "-";
 /// k2tools filter -r report.txt -k output.txt \
 ///     -i reads.fq.gz -o host_and_unclass.fq.gz -t 9606 -d -u
 /// ```
+///
+/// Extract classified reads outside the human clade (taxon 9606), by selecting
+/// everything under root (taxon 1) and excluding human and its descendants. Note that
+/// exclusion removes only the excluded clade itself: reads kraken2 assigned to an
+/// *ancestor* of the excluded taxon (e.g. Primates or Mammalia for human) are retained,
+/// so this is not a substitute for host depletion:
+///
+/// ```bash
+/// k2tools filter -r report.txt -k output.txt \
+///     -i reads.fq.gz -o non_human.fq.gz -t 1 -e 9606 -d
+/// ```
+///
+/// Extract all Felidae (taxon 9681) except Panthera (taxon 9688):
+///
+/// ```bash
+/// k2tools filter -r report.txt -k output.txt \
+///     -i reads.fq.gz -o cats.fq.gz -t 9681 -e 9688 -d
+/// ```
 #[derive(clap::Args)]
 pub struct Filter {
     /// Path to the kraken2 report file.
@@ -139,6 +162,11 @@ pub struct Filter {
     /// --include-unclassified must be specified.
     #[arg(short, long, num_args = 1..)]
     taxon_ids: Vec<u64>,
+
+    /// Taxon ID(s) to exclude from the selected set. Requires --taxon-ids.
+    /// Descendants are also excluded when --include-descendants is set.
+    #[arg(short = 'e', long, num_args = 1..)]
+    exclude_taxon_ids: Vec<u64>,
 
     /// Include reads assigned to any descendant of the specified taxa.
     #[arg(short = 'd', long, default_value_t = false)]
@@ -169,6 +197,7 @@ impl Command for Filter {
         let (taxon_set, expected) = build_taxon_set_and_expected_count(
             &report,
             &self.taxon_ids,
+            &self.exclude_taxon_ids,
             self.include_descendants,
             self.include_unclassified,
         )?;
@@ -249,6 +278,10 @@ impl Filter {
         anyhow::ensure!(
             !self.taxon_ids.is_empty() || self.include_unclassified,
             "at least one --taxon-ids value or --include-unclassified must be specified"
+        );
+        anyhow::ensure!(
+            self.exclude_taxon_ids.is_empty() || !self.taxon_ids.is_empty(),
+            "--exclude-taxon-ids requires --taxon-ids"
         );
         Ok(())
     }
@@ -529,15 +562,21 @@ fn verify_fastq_exhausted(
 /// Builds the set of taxon IDs to filter for and computes the expected number of
 /// matching reads from the report's count fields.
 ///
-/// If `include_descendants` is true, expands each taxon ID to include all its
-/// descendants in the report taxonomy tree. If `include_unclassified` is true,
-/// adds taxon ID 0. The expected count uses `clade_count` when descendants are
-/// included, `direct_count` otherwise.
+/// If `include_descendants` is true, expands each taxon ID (included and excluded)
+/// to cover all its descendants in the report taxonomy tree. If `include_unclassified`
+/// is true, adds taxon ID 0. Taxa in `exclude_taxon_ids` are then removed from the
+/// set; excluded taxa not present in the report are ignored with a warning, since a
+/// taxon with no reads in the sample has nothing to exclude, and an exclusion that
+/// removes nothing from the selection warns (usually a forgotten `-d`). The expected
+/// count uses `clade_count` when descendants are included, `direct_count` otherwise,
+/// minus the `direct_count` of each taxon removed by exclusion.
 ///
-/// Returns `(taxon_id_set, expected_read_count)`.
+/// Returns `(taxon_id_set, expected_read_count)`. Errors if exclusion removes every
+/// selected taxon, since that would silently produce empty outputs.
 fn build_taxon_set_and_expected_count(
     report: &KrakenReport,
     taxon_ids: &[u64],
+    exclude_taxon_ids: &[u64],
     include_descendants: bool,
     include_unclassified: bool,
 ) -> Result<(HashSet<u64>, u64)> {
@@ -567,6 +606,37 @@ fn build_taxon_set_and_expected_count(
             expected += row.clade_count();
         }
     }
+
+    for &tid in exclude_taxon_ids {
+        let Some(idx) = report.index_of_taxon_id(tid) else {
+            log::warn!("Excluded taxon ID {tid} not found in report; ignoring");
+            continue;
+        };
+
+        let mut indices = vec![idx];
+        if include_descendants {
+            indices.extend(report.descendants(idx));
+        }
+        let mut removed = 0_usize;
+        for i in indices {
+            let row = report.row(i);
+            if set.remove(&row.taxon_id()) {
+                removed += 1;
+                expected = expected.saturating_sub(row.direct_count());
+            }
+        }
+        if removed == 0 {
+            log::warn!(
+                "Excluded taxon ID {tid} removed nothing from the selection; it was not \
+                 selected by --taxon-ids (missing --include-descendants?) or already excluded"
+            );
+        }
+    }
+
+    anyhow::ensure!(
+        !set.is_empty(),
+        "--exclude-taxon-ids removed every selected taxon; nothing would be extracted"
+    );
 
     Ok((set, expected))
 }
@@ -621,13 +691,15 @@ mod tests {
     use super::*;
 
     fn make_report() -> KrakenReport {
-        // unclassified(0), root(1), Bacteria(2), E.coli(3), Eukaryota(4), Human(5)
+        // unclassified(0), root(1), Bacteria(2), E.coli(3), Eukaryota(4), Human(5).
+        // Counts are internally consistent: each clade count equals the taxon's
+        // direct count plus its children's clade counts, as kraken2 guarantees.
         let lines = [
             " 10.00\t100\t100\tU\t0\tunclassified",
-            " 90.00\t900\t5\tR\t1\troot",
-            " 60.00\t600\t10\tD\t2\t  Bacteria",
+            " 90.00\t900\t0\tR\t1\troot",
+            " 60.00\t600\t100\tD\t2\t  Bacteria",
             " 50.00\t500\t500\tS\t3\t    Escherichia coli",
-            " 30.00\t300\t10\tD\t4\t  Eukaryota",
+            " 30.00\t300\t100\tD\t4\t  Eukaryota",
             " 20.00\t200\t200\tS\t5\t    Homo sapiens",
         ]
         .join("\n");
@@ -638,7 +710,7 @@ mod tests {
     fn test_build_taxon_set_exact() {
         let report = make_report();
         let (set, expected) =
-            build_taxon_set_and_expected_count(&report, &[3], false, false).unwrap();
+            build_taxon_set_and_expected_count(&report, &[3], &[], false, false).unwrap();
         assert_eq!(set, HashSet::from([3]));
         assert_eq!(expected, 500);
     }
@@ -647,7 +719,7 @@ mod tests {
     fn test_build_taxon_set_with_descendants() {
         let report = make_report();
         let (set, expected) =
-            build_taxon_set_and_expected_count(&report, &[2], true, false).unwrap();
+            build_taxon_set_and_expected_count(&report, &[2], &[], true, false).unwrap();
         assert_eq!(set, HashSet::from([2, 3]));
         assert_eq!(expected, 600);
     }
@@ -656,7 +728,7 @@ mod tests {
     fn test_build_taxon_set_with_descendants_root() {
         let report = make_report();
         let (set, expected) =
-            build_taxon_set_and_expected_count(&report, &[1], true, false).unwrap();
+            build_taxon_set_and_expected_count(&report, &[1], &[], true, false).unwrap();
         assert_eq!(set, HashSet::from([1, 2, 3, 4, 5]));
         assert_eq!(expected, 900);
     }
@@ -664,7 +736,7 @@ mod tests {
     #[test]
     fn test_build_taxon_set_unknown_taxon() {
         let report = make_report();
-        let result = build_taxon_set_and_expected_count(&report, &[99999], false, false);
+        let result = build_taxon_set_and_expected_count(&report, &[99999], &[], false, false);
         assert!(result.is_err());
     }
 
@@ -672,7 +744,7 @@ mod tests {
     fn test_build_taxon_set_include_unclassified() {
         let report = make_report();
         let (set, expected) =
-            build_taxon_set_and_expected_count(&report, &[3], false, true).unwrap();
+            build_taxon_set_and_expected_count(&report, &[3], &[], false, true).unwrap();
         assert_eq!(set, HashSet::from([0, 3]));
         assert_eq!(expected, 600);
     }
@@ -681,7 +753,7 @@ mod tests {
     fn test_build_taxon_set_only_unclassified() {
         let report = make_report();
         let (set, expected) =
-            build_taxon_set_and_expected_count(&report, &[], false, true).unwrap();
+            build_taxon_set_and_expected_count(&report, &[], &[], false, true).unwrap();
         assert_eq!(set, HashSet::from([0]));
         assert_eq!(expected, 100);
     }
@@ -689,7 +761,8 @@ mod tests {
     #[test]
     fn test_expected_count_with_descendants() {
         let report = make_report();
-        let (_, expected) = build_taxon_set_and_expected_count(&report, &[2], true, false).unwrap();
+        let (_, expected) =
+            build_taxon_set_and_expected_count(&report, &[2], &[], true, false).unwrap();
         assert_eq!(expected, 600);
     }
 
@@ -697,15 +770,80 @@ mod tests {
     fn test_expected_count_without_descendants() {
         let report = make_report();
         let (_, expected) =
-            build_taxon_set_and_expected_count(&report, &[2], false, false).unwrap();
-        assert_eq!(expected, 10);
+            build_taxon_set_and_expected_count(&report, &[2], &[], false, false).unwrap();
+        assert_eq!(expected, 100);
     }
 
     #[test]
     fn test_expected_count_with_unclassified() {
         let report = make_report();
-        let (_, expected) = build_taxon_set_and_expected_count(&report, &[3], false, true).unwrap();
+        let (_, expected) =
+            build_taxon_set_and_expected_count(&report, &[3], &[], false, true).unwrap();
         assert_eq!(expected, 600);
+    }
+
+    #[test]
+    fn test_exclude_removes_taxon_and_its_expected_count() {
+        let report = make_report();
+        let (set, expected) =
+            build_taxon_set_and_expected_count(&report, &[3, 5], &[5], false, false).unwrap();
+        assert_eq!(set, HashSet::from([3]));
+        assert_eq!(expected, 500);
+    }
+
+    #[test]
+    fn test_exclude_with_descendants_removes_whole_clade() {
+        let report = make_report();
+        // Everything under root except the Eukaryota clade (4 and Human 5); the
+        // expected count is exactly clade(root) - clade(Eukaryota)
+        let (set, expected) =
+            build_taxon_set_and_expected_count(&report, &[1], &[4], true, false).unwrap();
+        assert_eq!(set, HashSet::from([1, 2, 3]));
+        assert_eq!(expected, 900 - 300);
+    }
+
+    #[test]
+    fn test_exclude_of_taxon_not_in_set_is_noop() {
+        let report = make_report();
+        // E.coli (3) is a descendant of Bacteria (2) but descendants were not included
+        let (set, expected) =
+            build_taxon_set_and_expected_count(&report, &[2], &[3], false, false).unwrap();
+        assert_eq!(set, HashSet::from([2]));
+        assert_eq!(expected, 100);
+    }
+
+    #[test]
+    fn test_exclude_taxon_missing_from_report_is_ignored() {
+        let report = make_report();
+        let (set, expected) =
+            build_taxon_set_and_expected_count(&report, &[3], &[99999], false, false).unwrap();
+        assert_eq!(set, HashSet::from([3]));
+        assert_eq!(expected, 500);
+    }
+
+    #[test]
+    fn test_exclude_of_other_taxon_leaves_unclassified_in_set() {
+        let report = make_report();
+        let (set, expected) =
+            build_taxon_set_and_expected_count(&report, &[1], &[5], true, true).unwrap();
+        assert_eq!(set, HashSet::from([0, 1, 2, 3, 4]));
+        assert_eq!(expected, 900 + 100 - 200);
+    }
+
+    #[test]
+    fn test_exclude_of_taxon_zero_removes_unclassified() {
+        let report = make_report();
+        let (set, expected) =
+            build_taxon_set_and_expected_count(&report, &[1], &[0], true, true).unwrap();
+        assert_eq!(set, HashSet::from([1, 2, 3, 4, 5]));
+        assert_eq!(expected, 900);
+    }
+
+    #[test]
+    fn test_exclusion_of_all_selected_taxa_errors() {
+        let report = make_report();
+        let result = build_taxon_set_and_expected_count(&report, &[3], &[3], false, false);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -746,6 +884,7 @@ mod tests {
             input: inputs.iter().map(PathBuf::from).collect(),
             output: outputs.iter().map(PathBuf::from).collect(),
             taxon_ids: vec![1],
+            exclude_taxon_ids: vec![],
             include_descendants: false,
             include_unclassified: false,
             threads: 4,
@@ -803,8 +942,26 @@ mod tests {
             input: vec![PathBuf::from("a.fq")],
             output: vec![PathBuf::from("b.fq")],
             taxon_ids: vec![],
+            exclude_taxon_ids: vec![],
             include_descendants: false,
             include_unclassified: false,
+            threads: 4,
+            compression_level: 6,
+        };
+        assert!(filter.validate_args().is_err());
+    }
+
+    #[test]
+    fn test_validate_args_exclude_requires_taxon_ids() {
+        let filter = Filter {
+            kraken_report: PathBuf::from("r.txt"),
+            kraken_output: PathBuf::from("k.txt"),
+            input: vec![PathBuf::from("a.fq")],
+            output: vec![PathBuf::from("b.fq")],
+            taxon_ids: vec![],
+            exclude_taxon_ids: vec![5],
+            include_descendants: false,
+            include_unclassified: true,
             threads: 4,
             compression_level: 6,
         };

@@ -106,9 +106,10 @@ fn run_filter(args: &[&str]) -> std::process::Output {
     Command::new(k2tools_bin()).arg("filter").args(args).output().unwrap()
 }
 
-// A standard report with:
+// A standard report with internally consistent counts (each clade count equals
+// the taxon's direct count plus its children's clade counts):
 // unclassified(0): 100 reads
-// root(1): 900 reads, 5 direct
+// root(1): 900 reads, 0 direct
 //   Bacteria(2): 600 reads, 100 direct
 //     E.coli(3): 500 reads, 500 direct
 //   Eukaryota(4): 300 reads, 100 direct
@@ -116,7 +117,7 @@ fn run_filter(args: &[&str]) -> std::process::Output {
 fn standard_report_lines() -> Vec<&'static str> {
     vec![
         " 10.00\t100\t100\tU\t0\tunclassified",
-        " 90.00\t900\t5\tR\t1\troot",
+        " 90.00\t900\t0\tR\t1\troot",
         " 60.00\t600\t100\tD\t2\t  Bacteria",
         " 50.00\t500\t500\tS\t3\t    Escherichia coli",
         " 30.00\t300\t100\tD\t4\t  Eukaryota",
@@ -319,6 +320,163 @@ fn test_taxon_ids_plus_unclassified() {
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].0, "r2");
     assert_eq!(records[1].0, "r3");
+}
+
+#[test]
+fn test_exclude_taxon_drops_its_reads() {
+    let dir = TempDir::new().unwrap();
+    let report = write_report(dir.path(), &standard_report_lines());
+    let kraken = write_kraken_output(dir.path(), &make_kraken_lines());
+    let input = write_fastq(dir.path(), "input.fq", &make_reads());
+    let output = dir.path().join("output.fq.gz");
+
+    // All classified reads (root + descendants) except Human (5)
+    let result = run_filter(&[
+        "-r",
+        report.to_str().unwrap(),
+        "-k",
+        kraken.to_str().unwrap(),
+        "-i",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "-t",
+        "1",
+        "-e",
+        "5",
+        "-d",
+        "--threads",
+        "2",
+    ]);
+
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    let records = read_output_fastq(&output);
+    // r1 (E.coli 3), r4 (Bacteria 2), r5 (E.coli 3); drops r2 (unclassified) and r3 (Human 5)
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].0, "r1");
+    assert_eq!(records[1].0, "r4");
+    assert_eq!(records[2].0, "r5");
+}
+
+#[test]
+fn test_exclude_with_descendants_drops_whole_clade() {
+    let dir = TempDir::new().unwrap();
+    let report = write_report(dir.path(), &standard_report_lines());
+    let kraken = write_kraken_output(dir.path(), &make_kraken_lines());
+    let input = write_fastq(dir.path(), "input.fq", &make_reads());
+    let output = dir.path().join("output.fq.gz");
+
+    // Everything under root except the Bacteria clade (2 and E.coli 3)
+    let result = run_filter(&[
+        "-r",
+        report.to_str().unwrap(),
+        "-k",
+        kraken.to_str().unwrap(),
+        "-i",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "-t",
+        "1",
+        "-e",
+        "2",
+        "-d",
+        "--threads",
+        "2",
+    ]);
+
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    let records = read_output_fastq(&output);
+    // Only r3 (Human 5) remains among the classified reads
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0, "r3");
+}
+
+#[test]
+fn test_exclude_taxon_missing_from_report_is_ignored() {
+    let dir = TempDir::new().unwrap();
+    let report = write_report(dir.path(), &standard_report_lines());
+    let kraken = write_kraken_output(dir.path(), &make_kraken_lines());
+    let input = write_fastq(dir.path(), "input.fq", &make_reads());
+    let output = dir.path().join("output.fq.gz");
+
+    let result = run_filter(&[
+        "-r",
+        report.to_str().unwrap(),
+        "-k",
+        kraken.to_str().unwrap(),
+        "-i",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "-t",
+        "1",
+        "-e",
+        "99999",
+        "-d",
+        "--threads",
+        "2",
+    ]);
+
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    let records = read_output_fastq(&output);
+    // All classified reads kept: r1, r3, r4, r5
+    assert_eq!(records.len(), 4);
+}
+
+#[test]
+fn test_excluding_every_selected_taxon_errors() {
+    let dir = TempDir::new().unwrap();
+    let report = write_report(dir.path(), &standard_report_lines());
+    let kraken = write_kraken_output(dir.path(), &make_kraken_lines());
+    let input = write_fastq(dir.path(), "input.fq", &make_reads());
+    let output = dir.path().join("output.fq.gz");
+
+    let result = run_filter(&[
+        "-r",
+        report.to_str().unwrap(),
+        "-k",
+        kraken.to_str().unwrap(),
+        "-i",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "-t",
+        "3",
+        "-e",
+        "3",
+    ]);
+
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("nothing would be extracted"), "stderr: {stderr}");
+}
+
+#[test]
+fn test_exclude_without_taxon_ids_errors() {
+    let dir = TempDir::new().unwrap();
+    let report = write_report(dir.path(), &standard_report_lines());
+    let kraken = write_kraken_output(dir.path(), &make_kraken_lines());
+    let input = write_fastq(dir.path(), "input.fq", &make_reads());
+    let output = dir.path().join("output.fq.gz");
+
+    let result = run_filter(&[
+        "-r",
+        report.to_str().unwrap(),
+        "-k",
+        kraken.to_str().unwrap(),
+        "-i",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "-u",
+        "-e",
+        "5",
+    ]);
+
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("--exclude-taxon-ids requires --taxon-ids"), "stderr: {stderr}");
 }
 
 #[test]
