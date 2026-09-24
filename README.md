@@ -135,6 +135,17 @@ k2tools filter \
     -t 9606 -d -u
 ```
 
+Exclude taxa from the selection with `-e`/`--exclude-taxon-ids`, e.g. all Felidae (taxon 9681) except the Panthera clade (taxon 9688):
+
+```bash
+k2tools filter \
+    -r report.txt -k kraken_output.txt \
+    -i reads.fq.gz -o cats_not_panthera.fq.gz \
+    -t 9681 -e 9688 -d
+```
+
+Exclusion removes only the excluded clade itself; reads assigned to an ancestor of the excluded taxon (e.g. Felidae in the example above) are retained.
+
 ### `report-to-tsv`
 
 Converts a kraken2 report (standard 6-column or extended 8-column format) into a clean TSV with clearly named columns, derived parent information, taxonomy level, descendant counts, and sequence fraction columns.
