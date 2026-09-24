@@ -8,6 +8,14 @@ homepage = "https://github.com/fulcrumgenomics/k2tools"
 license = "MIT"
 edition = "2024"
 rust-version = "1.85.0"
+include = [
+    "/src",
+    "/build.rs",
+    "/tests",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE",
+]
 
 [lib]
 name = "k2tools_lib"
