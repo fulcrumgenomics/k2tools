@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use fgoxide::io::Io;
 use fgoxide::iter::IntoChunkedReadAheadIterator;
 use pooled_writer::bgzf::BgzfCompressor;
-use pooled_writer::{PoolBuilder, PooledWriter};
+use pooled_writer::{Pool, PoolBuilder, PooledWriter};
 use seq_io::fastq::{Error as FastqError, OwnedRecord, Reader as FastqReader, Record};
 
 use crate::commands::command::Command;
@@ -21,14 +21,19 @@ const READ_AHEAD_CHUNK_SIZE: usize = 1024;
 /// Number of buffered chunks in the read-ahead channel.
 const READ_AHEAD_NUM_CHUNKS: usize = 1024;
 
-/// Buffer size used when opening input files for reading.
+/// Buffer size used when opening input files for reading and uncompressed outputs for
+/// writing.
 const IO_BUFFER_SIZE: usize = 512 * 1024;
+
+/// Output path that writes uncompressed FASTQ to stdout instead of a file.
+const STDOUT_PATH: &str = "-";
 
 /// Filter reads from FASTQ files based on kraken2 classification results.
 ///
 /// Extracts reads classified to one or more taxon IDs from FASTQ files, using the
 /// kraken2 report (taxonomy tree) and per-read classification output. Supports both
-/// single-end and paired-end reads, and writes bgzf-compressed output.
+/// single-end and paired-end reads, and writes bgzf-compressed or uncompressed FASTQ to
+/// files or stdout.
 ///
 /// # Required inputs
 ///
@@ -62,12 +67,16 @@ const IO_BUFFER_SIZE: usize = 512 * 1024;
 ///
 /// # Output
 ///
-/// - **`--output`** (`-o`): Output FASTQ file path(s). Must provide the same number of
-///   output files as input files (one for single-end, two for paired-end). Outputs are
-///   always bgzf-compressed regardless of file extension.
-/// - **`--threads`**: Number of threads used for bgzf compression (default: 4).
-/// - **`--compression-level`**: Bgzf compression level from 0 (fastest) to 9 (smallest),
-///   default 5.
+/// The number of `--output` (`-o`) paths sets the layout. One output per input writes
+/// single-end reads, or R1 and R2 to separate files. A single output for paired-end
+/// input interleaves the reads (R1, R2, R1, R2, ...).
+///
+/// Each output's extension sets its compression: `.gz` and `.bgz` paths are written
+/// bgzf-compressed, and any other path is written as uncompressed FASTQ. `-` writes
+/// uncompressed FASTQ to stdout, and may be given for only one output.
+///
+/// `--threads` and `--compression-level` control bgzf compression and have no effect
+/// when no output is bgzf-compressed.
 ///
 /// # Examples
 ///
@@ -92,6 +101,13 @@ const IO_BUFFER_SIZE: usize = 512 * 1024;
 ///     -i r1.fq.gz r2.fq.gz -o unclass_r1.fq.gz unclass_r2.fq.gz -u
 /// ```
 ///
+/// Stream _E. coli_ read pairs, interleaved and uncompressed, straight into an aligner:
+///
+/// ```bash
+/// k2tools filter -r report.txt -k output.txt \
+///     -i r1.fq.gz r2.fq.gz -o - -t 562 | bwa mem -p ref.fa -
+/// ```
+///
 /// Extract human reads plus unclassified in a single pass:
 ///
 /// ```bash
@@ -113,8 +129,9 @@ pub struct Filter {
     #[arg(short, long, num_args = 1..=2, required = true)]
     input: Vec<PathBuf>,
 
-    /// Output FASTQ file(s). Must match the number of inputs.
-    /// Written with bgzf compression.
+    /// Output FASTQ file(s): one per input, or one for paired-end input to interleave
+    /// R1 and R2. `.gz`/`.bgz` paths are bgzf-compressed, other paths are uncompressed,
+    /// and `-` writes uncompressed FASTQ to stdout.
     #[arg(short, long, num_args = 1..=2, required = true)]
     output: Vec<PathBuf>,
 
@@ -131,11 +148,11 @@ pub struct Filter {
     #[arg(short = 'u', long, default_value_t = false)]
     include_unclassified: bool,
 
-    /// Number of threads for bgzf compression.
+    /// Number of threads for bgzf compression. Unused if no output is bgzf.
     #[arg(long, default_value_t = 4)]
     threads: usize,
 
-    /// Bgzf compression level (0-9).
+    /// Bgzf compression level (0-9). Unused if no output is bgzf.
     #[arg(long, default_value_t = 5)]
     compression_level: u8,
 }
@@ -161,23 +178,19 @@ impl Command for Filter {
             format_count(expected),
         );
 
-        let (total, kept) = self.run_filter_pipeline(&taxon_set).map_err(|e| {
-            let banner = "#".repeat(72);
-            let output_paths: Vec<_> =
-                self.output.iter().map(|p| format!("  {}", p.display())).collect();
-            eprintln!(
-                "\n{banner}\n\
-                 # ERROR: invalid inputs detected\n\
-                 #\n\
-                 # {e}\n\
-                 #\n\
-                 # WARNING: partial/invalid output files may have been written to:\n\
-                 # {}\n\
-                 {banner}\n",
-                output_paths.join("\n"),
-            );
-            e
-        })?;
+        let (total, kept) = match self.run_filter_pipeline(&taxon_set) {
+            Ok(counts) => counts,
+            // A downstream reader closing stdout early (e.g. `| head`) is a normal way to
+            // stop, not an input error
+            Err(e) if self.output.iter().any(|p| is_stdout(p)) && is_broken_pipe(&e) => {
+                log::info!("Stdout was closed by the downstream reader; stopping early.");
+                return Ok(());
+            }
+            Err(e) => {
+                self.print_error_banner(&e);
+                return Err(e);
+            }
+        };
 
         #[allow(clippy::cast_precision_loss)]
         let pct = if total > 0 { kept as f64 / total as f64 * 100.0 } else { 0.0 };
@@ -195,7 +208,7 @@ impl Command for Filter {
 impl Filter {
     /// Handles the case where kraken2 was run on empty FASTQ files, producing an
     /// empty report and no kraken output file. Verifies that all FASTQ inputs are
-    /// truly empty, then writes valid empty bgzf output files.
+    /// truly empty, then writes valid empty outputs.
     fn handle_empty_inputs(&self) -> Result<()> {
         let io = Io::new(u32::from(self.compression_level), IO_BUFFER_SIZE);
         for path in &self.input {
@@ -212,23 +225,24 @@ impl Filter {
             }
         }
 
-        let (mut pool, writers) = self.build_writer_pool()?;
-        for w in writers {
-            w.close()?;
-        }
-        pool.stop_pool()?;
+        let (pool, writers) = self.build_writers()?;
+        close_writers(pool, writers)?;
 
-        log::info!("Report is empty; all inputs are empty. Wrote empty output files.");
+        log::info!("Report is empty; all inputs are empty. Wrote empty outputs.");
         Ok(())
     }
 
     /// Validates command-line arguments beyond what clap enforces.
     fn validate_args(&self) -> Result<()> {
+        let (num_inputs, num_outputs) = (self.input.len(), self.output.len());
         anyhow::ensure!(
-            self.input.len() == self.output.len(),
-            "number of input files ({}) must match number of output files ({})",
-            self.input.len(),
-            self.output.len()
+            num_outputs == num_inputs || (num_inputs == 2 && num_outputs == 1),
+            "got {num_inputs} input(s) and {num_outputs} output(s); give one output per input, \
+             or a single output to interleave paired-end reads"
+        );
+        anyhow::ensure!(
+            self.output.iter().filter(|p| is_stdout(p)).count() <= 1,
+            "only one output may be written to stdout ('{STDOUT_PATH}')"
         );
         anyhow::ensure!(self.threads >= 1, "threads must be at least 1");
         anyhow::ensure!(self.compression_level <= 9, "compression level must be 0-9");
@@ -250,6 +264,9 @@ impl Filter {
             .read_ahead(READ_AHEAD_CHUNK_SIZE, READ_AHEAD_NUM_CHUNKS);
 
         let is_paired = self.input.len() == 2;
+        if is_paired && self.output.len() == 1 {
+            log::info!("Writing paired-end reads interleaved to a single output");
+        }
         let mut fq_iter1 = FastqReader::new(
             io.new_reader(&self.input[0])
                 .with_context(|| format!("failed to open FASTQ: {}", self.input[0].display()))?,
@@ -269,7 +286,7 @@ impl Filter {
             None
         };
 
-        let (mut pool, mut writers) = self.build_writer_pool()?;
+        let (pool, mut writers) = self.build_writers()?;
         let mut progress = ProgressLogger::new("k2tools::filter", "reads", 5_000_000);
 
         // Run the filter and verification, capturing any error so we can
@@ -290,37 +307,151 @@ impl Filter {
 
         progress.finish();
 
-        // Always close writers before stopping the pool
-        for w in writers {
-            w.close()?;
-        }
-        pool.stop_pool()?;
-
-        result
+        // Close outputs even if filtering failed, but report the filtering error first
+        let close_result = close_writers(pool, writers);
+        let counts = result?;
+        close_result?;
+        Ok(counts)
     }
 
-    /// Constructs the bgzf writer pool and exchanges output files into pooled writers.
+    /// Prints a prominent banner to stderr describing `error` and warning that the
+    /// outputs may be incomplete.
+    fn print_error_banner(&self, error: &anyhow::Error) {
+        let banner = "#".repeat(72);
+        let output_paths: Vec<_> =
+            self.output
+                .iter()
+                .map(|p| {
+                    if is_stdout(p) { "  stdout".to_string() } else { format!("  {}", p.display()) }
+                })
+                .collect();
+        eprintln!(
+            "\n{banner}\n\
+             # ERROR: invalid inputs detected\n\
+             #\n\
+             # {error}\n\
+             #\n\
+             # WARNING: partial/invalid output files may have been written to:\n\
+             # {}\n\
+             {banner}\n",
+            output_paths.join("\n"),
+        );
+    }
+
+    /// Opens a writer for each output path. `-` writes uncompressed to stdout, `.gz` and
+    /// `.bgz` paths are bgzf-compressed through a writer pool, and any other path is
+    /// written uncompressed. The pool is only created if at least one output is bgzf.
+    ///
     /// Returns (pool, writers) so that destructuring as `let (pool, writers) = ...`
     /// ensures writers are dropped before the pool (reverse declaration order).
-    fn build_writer_pool(&self) -> Result<(pooled_writer::Pool, Vec<PooledWriter>)> {
-        let mut pool_builder = PoolBuilder::<_, BgzfCompressor>::new()
-            .threads(self.threads)
-            .queue_size(self.threads * 50)
-            .compression_level(self.compression_level)?;
+    fn build_writers(&self) -> Result<(Option<Pool>, Vec<FastqWriter>)> {
+        let mut pool_builder = if self.output.iter().any(Io::is_gzip_path) {
+            Some(
+                PoolBuilder::<BufWriter<File>, BgzfCompressor>::new()
+                    .threads(self.threads)
+                    .queue_size(self.threads * 50)
+                    .compression_level(self.compression_level)?,
+            )
+        } else {
+            None
+        };
 
-        let mut writers: Vec<PooledWriter> = Vec::new();
+        let mut writers = Vec::with_capacity(self.output.len());
         for path in &self.output {
+            if is_stdout(path) {
+                writers.push(FastqWriter::plain(Box::new(std::io::stdout().lock())));
+                continue;
+            }
             let file = File::create(path)
                 .with_context(|| format!("failed to create output: {}", path.display()))?;
-            writers.push(pool_builder.exchange(BufWriter::new(file)));
+            let writer = match pool_builder.as_mut() {
+                Some(builder) if Io::is_gzip_path(path) => {
+                    FastqWriter::Bgzf(builder.exchange(BufWriter::new(file)))
+                }
+                _ => FastqWriter::plain(Box::new(file)),
+            };
+            writers.push(writer);
         }
-        let pool = pool_builder.build()?;
+
+        let pool = pool_builder.map(PoolBuilder::build).transpose()?;
         Ok((pool, writers))
     }
 }
 
+/// A FASTQ output: bgzf-compressed through the shared writer pool, or uncompressed and
+/// written directly on the calling thread.
+enum FastqWriter {
+    Bgzf(PooledWriter),
+    Plain(BufWriter<Box<dyn Write>>),
+}
+
+impl FastqWriter {
+    /// Wraps `inner` in a buffered, uncompressed writer.
+    fn plain(inner: Box<dyn Write>) -> Self {
+        FastqWriter::Plain(BufWriter::with_capacity(IO_BUFFER_SIZE, inner))
+    }
+
+    /// Flushes any buffered data and closes the writer.
+    fn close(self) -> Result<()> {
+        match self {
+            FastqWriter::Bgzf(writer) => writer.close()?,
+            FastqWriter::Plain(mut writer) => writer.flush()?,
+        }
+        Ok(())
+    }
+}
+
+impl Write for FastqWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            FastqWriter::Bgzf(writer) => writer.write(buf),
+            FastqWriter::Plain(writer) => writer.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            FastqWriter::Bgzf(writer) => writer.flush(),
+            FastqWriter::Plain(writer) => writer.flush(),
+        }
+    }
+}
+
+/// Closes all writers and then stops the pool, if there is one. Pooled writers must be
+/// closed before their pool is stopped. Every writer is closed and the pool stopped even
+/// if an earlier step fails, and the first error is returned.
+fn close_writers(pool: Option<Pool>, writers: Vec<FastqWriter>) -> Result<()> {
+    let mut first_error = None;
+    for writer in writers {
+        if let Err(e) = writer.close() {
+            first_error.get_or_insert(e);
+        }
+    }
+    if let Some(mut pool) = pool {
+        if let Err(e) = pool.stop_pool() {
+            first_error.get_or_insert(e.into());
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Returns true if `error` was caused by writing to a pipe whose reader has closed.
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
+/// Returns true if `path` is the stdout marker `-`.
+fn is_stdout(path: &Path) -> bool {
+    path == Path::new(STDOUT_PATH)
+}
+
 /// Runs the main filter loop: co-iterates kraken output and FASTQ iterator(s) in
-/// lockstep, writing matching records to the output writers.
+/// lockstep, writing matching records to the output writers. R2 records go to the
+/// second writer if there are two, or are interleaved after R1 if there is only one.
 ///
 /// Returns (total_reads_processed, reads_kept).
 fn filter_reads(
@@ -328,11 +459,12 @@ fn filter_reads(
     fq_iter1: &mut impl Iterator<Item = Result<OwnedRecord, FastqError>>,
     mut fq_iter2: Option<&mut impl Iterator<Item = Result<OwnedRecord, FastqError>>>,
     taxon_set: &HashSet<u64>,
-    writers: &mut [PooledWriter],
+    writers: &mut [FastqWriter],
     progress: &mut ProgressLogger,
 ) -> Result<(u64, u64)> {
     let mut total: u64 = 0;
     let mut kept: u64 = 0;
+    let r2_writer_index = writers.len() - 1;
 
     for kraken_result in kraken_iter {
         let kraken_rec = kraken_result?;
@@ -366,7 +498,7 @@ fn filter_reads(
 
             write_fastq_record(&mut writers[0], &fq_rec1)?;
             if let Some(ref rec2) = fq_rec2 {
-                write_fastq_record(&mut writers[1], rec2)?;
+                write_fastq_record(&mut writers[r2_writer_index], rec2)?;
             }
             kept += 1;
         }
@@ -606,19 +738,60 @@ mod tests {
         assert!(validate_read_name("read1", b"read1/1 length=150", 1).is_ok());
     }
 
-    #[test]
-    fn test_validate_args_mismatched_counts() {
-        let filter = Filter {
+    /// Builds an otherwise-valid `Filter` with the given input and output paths.
+    fn filter_with_io(inputs: &[&str], outputs: &[&str]) -> Filter {
+        Filter {
             kraken_report: PathBuf::from("r.txt"),
             kraken_output: PathBuf::from("k.txt"),
-            input: vec![PathBuf::from("a.fq"), PathBuf::from("b.fq")],
-            output: vec![PathBuf::from("c.fq")],
+            input: inputs.iter().map(PathBuf::from).collect(),
+            output: outputs.iter().map(PathBuf::from).collect(),
             taxon_ids: vec![1],
             include_descendants: false,
             include_unclassified: false,
             threads: 4,
             compression_level: 6,
-        };
+        }
+    }
+
+    #[test]
+    fn test_validate_args_rejects_two_outputs_for_single_input() {
+        let filter = filter_with_io(&["a.fq"], &["b.fq", "c.fq"]);
+        assert!(filter.validate_args().is_err());
+    }
+
+    #[test]
+    fn test_validate_args_allows_single_output_for_paired_input() {
+        let filter = filter_with_io(&["a.fq", "b.fq"], &["c.fq"]);
+        assert!(filter.validate_args().is_ok());
+    }
+
+    #[test]
+    fn test_is_broken_pipe_detects_broken_pipe_io_error() {
+        let error = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        assert!(is_broken_pipe(&error));
+    }
+
+    #[test]
+    fn test_is_broken_pipe_detects_broken_pipe_under_context() {
+        let error = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            .context("failed to write output");
+        assert!(is_broken_pipe(&error));
+    }
+
+    #[test]
+    fn test_is_broken_pipe_ignores_other_io_errors() {
+        let error = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!is_broken_pipe(&error));
+    }
+
+    #[test]
+    fn test_is_broken_pipe_ignores_non_io_errors() {
+        assert!(!is_broken_pipe(&anyhow::anyhow!("read name mismatch")));
+    }
+
+    #[test]
+    fn test_validate_args_rejects_stdout_for_both_outputs() {
+        let filter = filter_with_io(&["a.fq", "b.fq"], &["-", "-"]);
         assert!(filter.validate_args().is_err());
     }
 

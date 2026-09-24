@@ -86,7 +86,9 @@ k2tools <command> --help
 
 ### `filter`
 
-Extracts reads from FASTQ files that were classified to one or more taxa by kraken2.  Requires three inputs from the same kraken2 run: the report file (`-r`), the per-read classification output (`-k`), and the FASTQ file(s) (`-i`).  Supports single-end and paired-end reads, gzip/bgzf-compressed inputs, and writes bgzf-compressed output.
+Extracts reads from FASTQ files that were classified to one or more taxa by kraken2.  Requires three inputs from the same kraken2 run: the report file (`-r`), the per-read classification output (`-k`), and the FASTQ file(s) (`-i`).  Supports single-end and paired-end reads and gzip/bgzf-compressed inputs.
+
+Give one output (`-o`) per input, or a single output for paired-end input to interleave R1 and R2. Outputs ending in `.gz` or `.bgz` are bgzf-compressed; any other path is written as uncompressed FASTQ, and `-` writes uncompressed FASTQ to stdout.
 
 Extract all reads classified as *E. coli* (taxon 562):
 
@@ -113,6 +115,15 @@ k2tools filter \
     -r report.txt -k kraken_output.txt \
     -i r1.fq.gz r2.fq.gz -o unclass_r1.fq.gz unclass_r2.fq.gz \
     -u
+```
+
+Stream *E. coli* read pairs, interleaved and uncompressed, straight into an aligner:
+
+```bash
+k2tools filter \
+    -r report.txt -k kraken_output.txt \
+    -i r1.fq.gz r2.fq.gz -o - \
+    -t 562 | bwa mem -p ref.fa -
 ```
 
 Combine taxon extraction with unclassified reads in a single pass:
