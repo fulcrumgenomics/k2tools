@@ -1,7 +1,7 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use flate2::Compression;
 use flate2::read::MultiGzDecoder;
@@ -60,11 +60,8 @@ fn write_fastq_gz(dir: &Path, name: &str, records: &[FqRecord]) -> PathBuf {
     path
 }
 
-/// Reads a bgzf/gzip FASTQ file and returns (name, seq) pairs.
-fn read_output_fastq(path: &Path) -> Vec<(String, String)> {
-    let file = File::open(path).unwrap();
-    let reader = BufReader::new(MultiGzDecoder::new(file));
-    let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
+/// Parses FASTQ lines and returns (name, seq) pairs.
+fn parse_fastq_lines(lines: &[String]) -> Vec<(String, String)> {
     let mut result = Vec::new();
     for chunk in lines.chunks(4) {
         assert!(chunk[0].starts_with('@'), "expected FASTQ header, got: {}", chunk[0]);
@@ -73,6 +70,26 @@ fn read_output_fastq(path: &Path) -> Vec<(String, String)> {
         result.push((name, seq));
     }
     result
+}
+
+/// Reads a bgzf/gzip FASTQ file and returns (name, seq) pairs.
+fn read_output_fastq(path: &Path) -> Vec<(String, String)> {
+    let file = File::open(path).unwrap();
+    let reader = BufReader::new(MultiGzDecoder::new(file));
+    let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
+    parse_fastq_lines(&lines)
+}
+
+/// Parses uncompressed FASTQ bytes (e.g. captured stdout) into (name, seq) pairs.
+fn parse_plain_fastq(bytes: &[u8]) -> Vec<(String, String)> {
+    let text = std::str::from_utf8(bytes).unwrap();
+    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+    parse_fastq_lines(&lines)
+}
+
+/// Returns true if the file starts with the gzip magic bytes.
+fn is_gzip_file(path: &Path) -> bool {
+    std::fs::read(path).unwrap().starts_with(&[0x1f, 0x8b])
 }
 
 /// Returns the path to the k2tools binary.
@@ -114,6 +131,17 @@ fn make_reads() -> Vec<FqRecord> {
         FqRecord { name: "r3", seq: "AAAA", qual: "IIII" }, // taxon 5 (Human)
         FqRecord { name: "r4", seq: "CCCC", qual: "IIII" }, // taxon 2 (Bacteria direct)
         FqRecord { name: "r5", seq: "GGGG", qual: "IIII" }, // taxon 3 (E.coli)
+    ]
+}
+
+/// R2 mates for `make_reads()`, with sequences distinct from their R1 mates.
+fn make_reads_r2() -> Vec<FqRecord> {
+    vec![
+        FqRecord { name: "r1", seq: "TTTT", qual: "IIII" },
+        FqRecord { name: "r2", seq: "AAAA", qual: "IIII" },
+        FqRecord { name: "r3", seq: "CCCC", qual: "IIII" },
+        FqRecord { name: "r4", seq: "GGGG", qual: "IIII" },
+        FqRecord { name: "r5", seq: "TTTT", qual: "IIII" },
     ]
 }
 
@@ -165,17 +193,8 @@ fn test_paired_end() {
     let report = write_report(dir.path(), &standard_report_lines());
     let kraken = write_kraken_output(dir.path(), &make_kraken_lines());
 
-    let reads_r1 = make_reads();
-    let reads_r2 = vec![
-        FqRecord { name: "r1", seq: "TTTT", qual: "IIII" },
-        FqRecord { name: "r2", seq: "AAAA", qual: "IIII" },
-        FqRecord { name: "r3", seq: "CCCC", qual: "IIII" },
-        FqRecord { name: "r4", seq: "GGGG", qual: "IIII" },
-        FqRecord { name: "r5", seq: "TTTT", qual: "IIII" },
-    ];
-
-    let in1 = write_fastq(dir.path(), "r1.fq", &reads_r1);
-    let in2 = write_fastq(dir.path(), "r2.fq", &reads_r2);
+    let in1 = write_fastq(dir.path(), "r1.fq", &make_reads());
+    let in2 = write_fastq(dir.path(), "r2.fq", &make_reads_r2());
     let out1 = dir.path().join("out1.fq.gz");
     let out2 = dir.path().join("out2.fq.gz");
 
@@ -712,4 +731,283 @@ fn test_nonempty_report_missing_kraken_output() {
     assert!(!result.status.success());
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(stderr.contains("failed to open kraken output"), "unexpected stderr: {stderr}");
+}
+
+#[test]
+fn test_non_gz_extension_writes_uncompressed_output() {
+    let dir = TempDir::new().unwrap();
+    let report = write_report(dir.path(), &standard_report_lines());
+    let kraken = write_kraken_output(dir.path(), &make_kraken_lines());
+    let input = write_fastq(dir.path(), "input.fq", &make_reads());
+    let output = dir.path().join("output.fq");
+
+    let result = run_filter(&[
+        "-r",
+        report.to_str().unwrap(),
+        "-k",
+        kraken.to_str().unwrap(),
+        "-i",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "-t",
+        "3",
+    ]);
+
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(!is_gzip_file(&output));
+    let records = parse_plain_fastq(&std::fs::read(&output).unwrap());
+    assert_eq!(
+        records,
+        vec![("r1".to_string(), "ACGT".to_string()), ("r5".to_string(), "GGGG".to_string())]
+    );
+}
+
+#[test]
+fn test_bgz_extension_writes_bgzf_output() {
+    let dir = TempDir::new().unwrap();
+    let report = write_report(dir.path(), &standard_report_lines());
+    let kraken = write_kraken_output(dir.path(), &make_kraken_lines());
+    let input = write_fastq(dir.path(), "input.fq", &make_reads());
+    let output = dir.path().join("output.fq.bgz");
+
+    let result = run_filter(&[
+        "-r",
+        report.to_str().unwrap(),
+        "-k",
+        kraken.to_str().unwrap(),
+        "-i",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "-t",
+        "3",
+    ]);
+
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(is_gzip_file(&output));
+    assert_eq!(read_output_fastq(&output).len(), 2);
+}
+
+#[test]
+fn test_single_end_output_to_stdout() {
+    let dir = TempDir::new().unwrap();
+    let report = write_report(dir.path(), &standard_report_lines());
+    let kraken = write_kraken_output(dir.path(), &make_kraken_lines());
+    let input = write_fastq(dir.path(), "input.fq", &make_reads());
+
+    let result = run_filter(&[
+        "-r",
+        report.to_str().unwrap(),
+        "-k",
+        kraken.to_str().unwrap(),
+        "-i",
+        input.to_str().unwrap(),
+        "-o",
+        "-",
+        "-t",
+        "3",
+    ]);
+
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    let records = parse_plain_fastq(&result.stdout);
+    assert_eq!(
+        records,
+        vec![("r1".to_string(), "ACGT".to_string()), ("r5".to_string(), "GGGG".to_string())]
+    );
+}
+
+#[test]
+fn test_paired_end_single_output_interleaves_to_stdout() {
+    let dir = TempDir::new().unwrap();
+    let report = write_report(dir.path(), &standard_report_lines());
+    let kraken = write_kraken_output(dir.path(), &make_kraken_lines());
+    let in1 = write_fastq(dir.path(), "r1.fq", &make_reads());
+    let in2 = write_fastq(dir.path(), "r2.fq", &make_reads_r2());
+
+    let result = run_filter(&[
+        "-r",
+        report.to_str().unwrap(),
+        "-k",
+        kraken.to_str().unwrap(),
+        "-i",
+        in1.to_str().unwrap(),
+        in2.to_str().unwrap(),
+        "-o",
+        "-",
+        "-t",
+        "3",
+    ]);
+
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    let records = parse_plain_fastq(&result.stdout);
+    assert_eq!(
+        records,
+        vec![
+            ("r1".to_string(), "ACGT".to_string()),
+            ("r1".to_string(), "TTTT".to_string()),
+            ("r5".to_string(), "GGGG".to_string()),
+            ("r5".to_string(), "TTTT".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn test_paired_end_single_output_interleaves_to_bgzf_file() {
+    let dir = TempDir::new().unwrap();
+    let report = write_report(dir.path(), &standard_report_lines());
+    let kraken = write_kraken_output(dir.path(), &make_kraken_lines());
+    let in1 = write_fastq(dir.path(), "r1.fq", &make_reads());
+    let in2 = write_fastq(dir.path(), "r2.fq", &make_reads_r2());
+    let output = dir.path().join("interleaved.fq.gz");
+
+    let result = run_filter(&[
+        "-r",
+        report.to_str().unwrap(),
+        "-k",
+        kraken.to_str().unwrap(),
+        "-i",
+        in1.to_str().unwrap(),
+        in2.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "-t",
+        "5",
+    ]);
+
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    let records = read_output_fastq(&output);
+    assert_eq!(
+        records,
+        vec![("r3".to_string(), "AAAA".to_string()), ("r3".to_string(), "CCCC".to_string())]
+    );
+}
+
+#[test]
+fn test_paired_end_mixed_uncompressed_and_bgzf_outputs() {
+    let dir = TempDir::new().unwrap();
+    let report = write_report(dir.path(), &standard_report_lines());
+    let kraken = write_kraken_output(dir.path(), &make_kraken_lines());
+    let in1 = write_fastq(dir.path(), "r1.fq", &make_reads());
+    let in2 = write_fastq(dir.path(), "r2.fq", &make_reads_r2());
+    let out1 = dir.path().join("out1.fq");
+    let out2 = dir.path().join("out2.fq.gz");
+
+    let result = run_filter(&[
+        "-r",
+        report.to_str().unwrap(),
+        "-k",
+        kraken.to_str().unwrap(),
+        "-i",
+        in1.to_str().unwrap(),
+        in2.to_str().unwrap(),
+        "-o",
+        out1.to_str().unwrap(),
+        out2.to_str().unwrap(),
+        "-t",
+        "5",
+    ]);
+
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(!is_gzip_file(&out1));
+    assert!(is_gzip_file(&out2));
+    assert_eq!(
+        parse_plain_fastq(&std::fs::read(&out1).unwrap()),
+        vec![("r3".to_string(), "AAAA".to_string())]
+    );
+    assert_eq!(read_output_fastq(&out2), vec![("r3".to_string(), "CCCC".to_string())]);
+}
+
+#[test]
+fn test_stdout_for_both_outputs_errors() {
+    let dir = TempDir::new().unwrap();
+    let report = write_report(dir.path(), &standard_report_lines());
+    let kraken = write_kraken_output(dir.path(), &make_kraken_lines());
+    let in1 = write_fastq(dir.path(), "r1.fq", &make_reads());
+    let in2 = write_fastq(dir.path(), "r2.fq", &make_reads_r2());
+
+    let result = run_filter(&[
+        "-r",
+        report.to_str().unwrap(),
+        "-k",
+        kraken.to_str().unwrap(),
+        "-i",
+        in1.to_str().unwrap(),
+        in2.to_str().unwrap(),
+        "-o",
+        "-",
+        "-",
+        "-t",
+        "3",
+    ]);
+
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("only one output may be written to stdout"), "unexpected: {stderr}");
+}
+
+#[test]
+fn test_empty_inputs_to_stdout_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let report = write_empty_report(dir.path());
+    let input = write_fastq(dir.path(), "input.fq", &[]);
+    let kraken = dir.path().join("nonexistent_kraken.txt");
+
+    let result = run_filter(&[
+        "-r",
+        report.to_str().unwrap(),
+        "-k",
+        kraken.to_str().unwrap(),
+        "-i",
+        input.to_str().unwrap(),
+        "-o",
+        "-",
+        "-t",
+        "1",
+    ]);
+
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(result.stdout.is_empty());
+}
+
+#[test]
+fn test_stdout_closed_early_by_reader_exits_successfully() {
+    // Enough reads that the output far exceeds the pipe and write buffers, so writes
+    // are still in progress when the reader goes away
+    let num_reads = 20_000;
+    let dir = TempDir::new().unwrap();
+    let report = write_report(
+        dir.path(),
+        &[&format!("100.00\t{num_reads}\t{num_reads}\tS\t3\tEscherichia coli")],
+    );
+    let kraken_path = dir.path().join("kraken_output.txt");
+    let fastq_path = dir.path().join("input.fq");
+    let mut kraken = File::create(&kraken_path).unwrap();
+    let mut fastq = File::create(&fastq_path).unwrap();
+    for i in 0..num_reads {
+        writeln!(kraken, "C\tread{i}\t3\t100\t3:1").unwrap();
+        writeln!(fastq, "@read{i}\n{}\n+\n{}", "A".repeat(100), "I".repeat(100)).unwrap();
+    }
+    drop((kraken, fastq));
+
+    let mut child = Command::new(k2tools_bin())
+        .arg("filter")
+        .args(["-r", report.to_str().unwrap()])
+        .args(["-k", kraken_path.to_str().unwrap()])
+        .args(["-i", fastq_path.to_str().unwrap()])
+        .args(["-o", "-", "-t", "3"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut first_bytes = [0_u8; 1024];
+    stdout.read_exact(&mut first_bytes).unwrap();
+    drop(stdout);
+    let result = child.wait_with_output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "stderr: {stderr}");
+    assert!(!stderr.contains("ERROR"), "unexpected error output: {stderr}");
+    assert!(first_bytes.starts_with(b"@read0\n"));
 }
