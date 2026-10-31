@@ -13,7 +13,7 @@ use k2tools_lib::commands::filter::Filter;
 use k2tools_lib::commands::report_to_tsv::ReportToTsv;
 
 #[global_allocator]
-static GLOBAL: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
