@@ -13,7 +13,7 @@ use k2tools_lib::commands::filter::Filter;
 use k2tools_lib::commands::report_to_tsv::ReportToTsv;
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
