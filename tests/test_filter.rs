@@ -1125,7 +1125,7 @@ fn test_empty_inputs_to_stdout_writes_nothing() {
     ]);
 
     assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
-    assert!(result.stdout.is_empty());
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "");
 }
 
 #[test]

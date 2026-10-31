@@ -332,8 +332,8 @@ mod tests {
 
         // All minimizer count fields should be non-empty
         for row in &rows {
-            assert!(!row.minimizer_count.is_empty());
-            assert!(!row.distinct_minimizer_count.is_empty());
+            assert_ne!(row.minimizer_count, "");
+            assert_ne!(row.distinct_minimizer_count, "");
         }
     }
 
