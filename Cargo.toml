@@ -25,7 +25,8 @@ env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
 csv = "1"
 chrono = "0.4"
-rpmalloc = "0.2"
+# 0.7 builds jemalloc with 64 KiB pages on aarch64 Linux, so it also runs on 16K- and 64K-page kernels
+tikv-jemallocator = "0.7"
 seq_io = "0.3"
 pooled-writer = "0.3"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }

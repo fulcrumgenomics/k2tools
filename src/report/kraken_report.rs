@@ -452,7 +452,7 @@ mod tests {
         assert_eq!(eukaryota_children, vec![4]);
 
         // Leaf has no children
-        assert!(kr.children(2).is_empty());
+        assert_eq!(kr.children(2), Vec::<usize>::new());
     }
 
     #[test]
@@ -612,7 +612,7 @@ mod tests {
     fn test_descendants_of_leaf() {
         let kr = parse(&minimal_standard_report());
         // Homo sapiens (index 2) is a leaf
-        assert!(kr.descendants(2).is_empty());
+        assert_eq!(kr.descendants(2), Vec::<usize>::new());
     }
 
     #[test]
